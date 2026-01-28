@@ -247,7 +247,7 @@ impl<'a> TerminalView<'a> {
                 commands.push(Command::Scroll(lines as i32));
             },
             ScrollDelta::Pixels { y, .. } => {
-                state.scroll_pixels -= y;
+                state.scroll_pixels += y;
                 let line_height = font_measure.height; // Assume this method exists and gives the height of a line
                 let lines = (state.scroll_pixels / line_height).trunc();
                 state.scroll_pixels %= line_height;
