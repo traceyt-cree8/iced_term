@@ -590,8 +590,14 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
     ) {
         let state = tree.state.downcast_mut::<TerminalViewState>();
         let layout_size = layout.bounds().size();
-        if state.size != layout_size {
+        // Send resize if size changed OR force resize on first few events to handle layout settling
+        let force_resize = state.resize_count < 3 && layout_size.width > 0.0 && layout_size.height > 0.0;
+        let needs_resize = state.size != layout_size || force_resize;
+        if needs_resize {
             state.size = layout_size;
+            if state.resize_count < 3 {
+                state.resize_count += 1;
+            }
             let cmd = Command::Resize(
                 Some(layout_size),
                 Some(self.term.font.measure),
@@ -668,6 +674,7 @@ struct TerminalViewState {
     keyboard_modifiers: Modifiers,
     size: Size<f32>,
     mouse_position_on_grid: TerminalGridPoint,
+    resize_count: u8, // Track resize attempts to ensure proper initialization
 }
 
 impl TerminalViewState {
@@ -680,6 +687,7 @@ impl TerminalViewState {
             keyboard_modifiers: Modifiers::empty(),
             size: Size::from([0.0, 0.0]),
             mouse_position_on_grid: TerminalGridPoint::default(),
+            resize_count: 0, // Force resize on first few renders
         }
     }
 }
