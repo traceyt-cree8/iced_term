@@ -111,6 +111,24 @@ impl Terminal {
     fn redraw(&mut self) {
         self.cache.clear();
     }
+
+    /// Search for all occurrences of a pattern in the terminal scrollback
+    pub fn search_all(&mut self, pattern: &str) -> Vec<backend::SearchMatch> {
+        let matches = self.backend.search_all(pattern);
+        self.sync_and_redraw();
+        matches
+    }
+
+    /// Get all terminal text content (including scrollback history)
+    pub fn get_all_text(&self) -> String {
+        self.backend.get_all_text()
+    }
+
+    /// Scroll the terminal to show a specific line
+    pub fn scroll_to_line(&mut self, line: i32) {
+        self.backend.scroll_to_line(line);
+        self.sync_and_redraw();
+    }
 }
 
 #[derive(Clone)]

@@ -24,6 +24,28 @@ use tokio::sync::mpsc;
 
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
 
+/// Escape special regex characters for literal string matching
+fn escape_regex(pattern: &str) -> String {
+    let mut escaped = String::with_capacity(pattern.len() * 2);
+    for c in pattern.chars() {
+        match c {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
+                escaped.push('\\');
+                escaped.push(c);
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+/// Represents a search match in the terminal scrollback
+#[derive(Debug, Clone)]
+pub struct SearchMatch {
+    pub start: Point,
+    pub end: Point,
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Write(Vec<u8>),
@@ -152,7 +174,10 @@ impl Backend {
             ..tty::Options::default()
         };
 
-        let config = term::Config::default();
+        let config = term::Config {
+            scrolling_history: settings.scrollback_lines,
+            ..term::Config::default()
+        };
         let terminal_size = TerminalSize::default();
         let pty = tty::new(&pty_config, terminal_size.into(), id)?;
 
@@ -512,6 +537,109 @@ impl Backend {
 
     pub fn renderable_content(&self) -> &RenderableContent {
         &self.last_content
+    }
+
+    /// Search for all occurrences of a pattern in the terminal scrollback
+    pub fn search_all(&mut self, pattern: &str) -> Vec<SearchMatch> {
+        if pattern.is_empty() {
+            return Vec::new();
+        }
+
+        // Escape special regex characters for literal search
+        let escaped = escape_regex(pattern);
+        let Ok(mut regex) = RegexSearch::new(&escaped) else {
+            return Vec::new();
+        };
+
+        let term = self.term.clone();
+        let term = term.lock();
+
+        let mut matches = Vec::new();
+
+        // Search from the beginning of history to the end of the viewport
+        let history_start = Line(-(term.grid().history_size() as i32));
+        let viewport_end = term.bottommost_line();
+
+        let start = Point::new(history_start, Column(0));
+        let end = Point::new(viewport_end, term.last_column());
+
+        for rm in RegexIter::new(start, end, Direction::Right, &term, &mut regex) {
+            matches.push(SearchMatch {
+                start: *rm.start(),
+                end: *rm.end(),
+            });
+        }
+
+        matches
+    }
+
+    /// Get all terminal text content (including scrollback history)
+    pub fn get_all_text(&self) -> String {
+        let term = self.term.clone();
+        let term = term.lock();
+
+        let mut result = String::new();
+        let mut current_line = None;
+        let mut line_text = String::new();
+
+        // Get the full range from history to viewport
+        let history_start = Line(-(term.grid().history_size() as i32));
+        let viewport_end = term.bottommost_line();
+
+        let start = Point::new(history_start, Column(0));
+        let end = Point::new(viewport_end, term.last_column());
+
+        // Iterate through all cells using display_iter
+        for indexed in term.grid().iter_from(start) {
+            // Check if we've moved to a new line
+            if Some(indexed.point.line) != current_line {
+                if current_line.is_some() {
+                    // Finish the previous line
+                    result.push_str(line_text.trim_end());
+                    result.push('\n');
+                }
+                current_line = Some(indexed.point.line);
+                line_text.clear();
+            }
+
+            // Add character to current line
+            line_text.push(indexed.c);
+
+            // Stop if we've reached the end
+            if indexed.point == end {
+                break;
+            }
+        }
+
+        // Add the final line
+        if !line_text.is_empty() {
+            result.push_str(line_text.trim_end());
+            result.push('\n');
+        }
+
+        result
+    }
+
+    /// Scroll the terminal to show a specific line
+    pub fn scroll_to_line(&mut self, line: i32) {
+        let term = self.term.clone();
+        let mut term = term.lock();
+
+        // Line is in history (negative) or viewport (positive)
+        // We want to scroll so the line is near the top of the viewport
+        let target_offset = if line < 0 {
+            // Line is in history - convert to display offset
+            (-line) as usize
+        } else {
+            0
+        };
+
+        // Calculate delta from current position
+        let current_offset = term.grid().display_offset();
+        if target_offset != current_offset {
+            let delta = target_offset as i32 - current_offset as i32;
+            term.grid_mut().scroll_display(Scroll::Delta(delta));
+        }
     }
 
     /// Based on alacritty/src/display/hint.rs > regex_match_at
