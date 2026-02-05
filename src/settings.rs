@@ -22,15 +22,22 @@ pub struct BackendSettings {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub working_directory: Option<PathBuf>,
+    /// Scrollback history in lines (default: 100,000 for Claude Code sessions)
+    pub scrollback_lines: usize,
 }
 
 impl Default for BackendSettings {
     fn default() -> Self {
+        let mut env = HashMap::new();
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+
         Self {
             program: DEFAULT_SHELL.to_string(),
             args: vec![],
-            env: HashMap::new(),
+            env,
             working_directory: None,
+            scrollback_lines: 100_000, // 10x default for Claude Code
         }
     }
 }
