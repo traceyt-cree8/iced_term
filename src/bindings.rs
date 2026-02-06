@@ -340,6 +340,8 @@ fn platform_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         KeyboardBinding;
         "c", Modifiers::SHIFT | Modifiers::COMMAND; BindingAction::Copy;
         "v", Modifiers::SHIFT | Modifiers::COMMAND; BindingAction::Paste;
+        Insert, Modifiers::SHIFT; BindingAction::Paste;
+        Insert, Modifiers::CTRL; BindingAction::Copy;
     )
 }
 
