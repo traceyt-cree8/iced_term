@@ -229,7 +229,7 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         "s",        Modifiers::CTRL; BindingAction::Char('\x13');
         "t",        Modifiers::CTRL; BindingAction::Char('\x14');
         "u",        Modifiers::CTRL; BindingAction::Char('\x51');
-        "v",        Modifiers::CTRL; BindingAction::Char('\x16');
+        // "v" removed - conflicts with Ctrl+V paste on Windows
         "w",        Modifiers::CTRL; BindingAction::Char('\x17');
         "x",        Modifiers::CTRL; BindingAction::Char('\x18');
         "y",        Modifiers::CTRL; BindingAction::Char('\x19');
