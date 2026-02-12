@@ -594,9 +594,18 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<TerminalViewState>();
+
+        // Reset resize state when a different terminal is shown at this tree position
+        // (e.g., tab switching reuses the same widget slot)
+        if state.terminal_id != self.term.id {
+            state.terminal_id = self.term.id;
+            state.resize_count = 0;
+            state.size = Size::from([0.0, 0.0]);
+        }
+
         let layout_size = layout.bounds().size();
         // Send resize if size changed OR force resize on first few events to handle layout settling
-        let force_resize = state.resize_count < 3 && layout_size.width > 0.0 && layout_size.height > 0.0;
+        let force_resize = state.resize_count < 5 && layout_size.width > 0.0 && layout_size.height > 0.0;
         let needs_resize = state.size != layout_size || force_resize;
         if needs_resize {
             state.size = layout_size;
@@ -680,6 +689,7 @@ struct TerminalViewState {
     size: Size<f32>,
     mouse_position_on_grid: TerminalGridPoint,
     resize_count: u8, // Track resize attempts to ensure proper initialization
+    terminal_id: u64, // Track which terminal this state belongs to
 }
 
 impl TerminalViewState {
@@ -693,6 +703,7 @@ impl TerminalViewState {
             size: Size::from([0.0, 0.0]),
             mouse_position_on_grid: TerminalGridPoint::default(),
             resize_count: 0, // Force resize on first few renders
+            terminal_id: u64::MAX, // Sentinel value to trigger reset on first use
         }
     }
 }
