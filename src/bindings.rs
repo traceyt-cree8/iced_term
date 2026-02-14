@@ -11,6 +11,7 @@ pub enum BindingAction {
     Char(char),
     Esc(String),
     LinkOpen,
+    Noop,
     Ignore,
 }
 

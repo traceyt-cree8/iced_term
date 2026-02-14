@@ -339,6 +339,9 @@ impl<'a> TerminalView<'a> {
                     self.term.backend.selectable_content(),
                 );
             },
+            BindingAction::Noop => {
+                return None;
+            },
             _ => {},
         };
 
@@ -401,10 +404,15 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
         let cell_height = term_size.cell_height as f32;
         let font_size = self.term.font.size;
         let font_scale_factor = self.term.font.scale_factor;
-        let layout_offset_x = layout.position().x;
-        let layout_offset_y = layout.position().y;
+        // Use widget-relative coordinates (0,0 = widget top-left)
+        // We'll translate the geometry to the widget's position when drawing
+        let layout_offset_x = 0.0_f32;
+        let layout_offset_y = 0.0_f32;
 
-        let geom = self.term.cache.draw(renderer, viewport.size(), |frame| {
+        // Use widget bounds size for the canvas frame so all rows fit
+        let frame_size = layout.bounds().size();
+
+        let geom = self.term.cache.draw(renderer, frame_size, |frame| {
             // Precompute constants used in the inner loop
             let display_offset = content.grid.display_offset() as f32;
             let cell_size = Size::new(cell_width, cell_height);
@@ -579,7 +587,12 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
         });
 
         use iced::advanced::graphics::geometry::Renderer as _;
-        renderer.draw_geometry(geom);
+        use iced_core::Renderer as _;
+        // Translate geometry from widget-relative coords to absolute window position
+        let translation = iced::Vector::new(layout.position().x, layout.position().y);
+        renderer.with_translation(translation, |renderer: &mut iced::Renderer| {
+            renderer.draw_geometry(geom);
+        });
     }
 
     fn update(
@@ -609,7 +622,7 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
         let needs_resize = state.size != layout_size || force_resize;
         if needs_resize {
             state.size = layout_size;
-            if state.resize_count < 3 {
+            if state.resize_count < 5 {
                 state.resize_count += 1;
             }
             let cmd = Command::Resize(
