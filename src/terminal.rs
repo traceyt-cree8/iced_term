@@ -93,6 +93,7 @@ impl Terminal {
     fn handle_internal(&mut self, cmd: Command, redraw: bool) -> Action {
         let mut action = Action::default();
         let mut visual_change = false;
+        let mut should_sync = redraw;
 
         match cmd {
             Command::ChangeTheme(color_pallete) => {
@@ -111,15 +112,23 @@ impl Terminal {
                 self.bindings.add_bindings(bindings);
             },
             Command::ProxyToBackend(cmd) => {
-                action = self.backend.handle(cmd);
+                if let backend::Command::Resize(layout_size, font_measure) = cmd
+                {
+                    should_sync &=
+                        self.backend.resize(layout_size, font_measure);
+                } else {
+                    action = self.backend.handle(cmd);
+                }
             },
         };
 
-        if redraw {
+        if should_sync {
             let content_changed = self.backend.sync();
             if content_changed || visual_change {
                 self.redraw();
             }
+        } else if visual_change {
+            self.redraw();
         }
         action
     }

@@ -99,7 +99,7 @@ pub enum LinkAction {
     Open,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct TerminalSize {
     pub cell_width: u16,
     pub cell_height: u16,
@@ -119,6 +119,39 @@ impl Default for TerminalSize {
             layout_width: 80.0,
             layout_height: 50.0,
         }
+    }
+}
+
+impl TerminalSize {
+    fn update(
+        &mut self,
+        layout_size: Option<Size<f32>>,
+        font_measure: Option<Size<f32>>,
+    ) {
+        if let Some(size) = layout_size {
+            self.layout_height = size.height;
+            self.layout_width = size.width;
+        }
+
+        if let Some(size) = font_measure {
+            self.cell_height = size.height as u16;
+            self.cell_width = size.width as u16;
+        }
+
+        let lines =
+            (self.layout_height / self.cell_height as f32).floor() as u16;
+        let cols = (self.layout_width / self.cell_width as f32).floor() as u16;
+        if lines > 0 && cols > 0 {
+            self.num_lines = lines;
+            self.num_cols = cols;
+        }
+    }
+
+    fn same_terminal_geometry(&self, other: &Self) -> bool {
+        self.cell_width == other.cell_width
+            && self.cell_height == other.cell_height
+            && self.num_cols == other.num_cols
+            && self.num_lines == other.num_lines
     }
 }
 
@@ -248,11 +281,7 @@ impl Backend {
                 return Action::default();
             },
             Command::Resize(layout_size, font_measure) => {
-                self.update_size(layout_size, font_measure);
-                let term = self.term.clone();
-                if let Some(mut term) = term.try_lock_unfair() {
-                    self.apply_resize(&mut term);
-                }
+                self.resize(layout_size, font_measure);
                 return Action::default();
             },
             // Commands that need the terminal lock — fall through below.
@@ -494,33 +523,25 @@ impl Backend {
         }
     }
 
-    fn update_size(
+    pub(crate) fn resize(
         &mut self,
         layout_size: Option<Size<f32>>,
         font_measure: Option<Size<f32>>,
-    ) {
-        if let Some(size) = layout_size {
-            self.size.layout_height = size.height;
-            self.size.layout_width = size.width;
-        };
-
-        if let Some(size) = font_measure {
-            self.size.cell_height = size.height as u16;
-            self.size.cell_width = size.width as u16;
+    ) -> bool {
+        self.size.update(layout_size, font_measure);
+        let resize_pending =
+            !self.size.same_terminal_geometry(&self.applied_size);
+        if resize_pending {
+            let term = self.term.clone();
+            if let Some(mut term) = term.try_lock_unfair() {
+                self.apply_resize(&mut term);
+            };
         }
-
-        let lines = (self.size.layout_height / self.size.cell_height as f32)
-            .floor() as u16;
-        let cols = (self.size.layout_width / self.size.cell_width as f32)
-            .floor() as u16;
-        if lines > 0 && cols > 0 {
-            self.size.num_lines = lines;
-            self.size.num_cols = cols;
-        }
+        resize_pending
     }
 
     fn apply_resize(&mut self, terminal: &mut Term<EventProxy>) {
-        if self.size == self.applied_size {
+        if self.size.same_terminal_geometry(&self.applied_size) {
             return;
         }
 
@@ -904,6 +925,18 @@ mod tests {
             Point::new(Line(0), Column(0))..=Point::new(Line(0), Column(3));
 
         assert_eq!(Backend::text_for_range(&term, &range), "http");
+    }
+
+    #[test]
+    fn terminal_size_tracks_only_effective_geometry_changes() {
+        let mut size = TerminalSize::default();
+        let original = size;
+
+        size.update(Some(Size::new(80.9, 50.9)), Some(Size::new(1.0, 1.0)));
+        assert!(size.same_terminal_geometry(&original));
+
+        size.update(Some(Size::new(81.0, 50.0)), None);
+        assert!(!size.same_terminal_geometry(&original));
     }
 }
 
