@@ -92,13 +92,20 @@ impl Terminal {
 
     fn handle_internal(&mut self, cmd: Command, redraw: bool) -> Action {
         let mut action = Action::default();
+        let mut visual_change = false;
 
         match cmd {
             Command::ChangeTheme(color_pallete) => {
                 self.theme = Theme::new(ThemeSettings::new(color_pallete));
+                visual_change = true;
             },
             Command::ChangeFont(font_settings) => {
                 self.font = TermFont::new(font_settings);
+                self.backend.handle(backend::Command::Resize(
+                    None,
+                    Some(self.font.measure),
+                ));
+                visual_change = true;
             },
             Command::AddBindings(bindings) => {
                 self.bindings.add_bindings(bindings);
@@ -109,7 +116,10 @@ impl Terminal {
         };
 
         if redraw {
-            self.sync_and_redraw();
+            let content_changed = self.backend.sync();
+            if content_changed || visual_change {
+                self.redraw();
+            }
         }
         action
     }
@@ -117,15 +127,9 @@ impl Terminal {
     /// Force a sync and redraw. Call after regaining focus if
     /// handle_no_redraw() was used while the window was unfocused.
     pub fn sync_and_redraw(&mut self) {
-        self.sync_font();
-        self.backend.sync();
-        self.redraw();
-    }
-
-    fn sync_font(&mut self) {
-        self.font.sync();
-        self.backend
-            .handle(backend::Command::Resize(None, Some(self.font.measure)));
+        if self.backend.sync() {
+            self.redraw();
+        }
     }
 
     fn redraw(&mut self) {

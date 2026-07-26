@@ -12,13 +12,13 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
-use alacritty_terminal::{tty, Grid};
+use alacritty_terminal::tty;
 use iced::keyboard::Modifiers;
 use iced_core::Size;
 use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
-use std::ops::{Index, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -29,10 +29,11 @@ fn escape_regex(pattern: &str) -> String {
     let mut escaped = String::with_capacity(pattern.len() * 2);
     for c in pattern.chars() {
         match c {
-            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' => {
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']'
+            | '{' | '}' | '^' | '$' => {
                 escaped.push('\\');
                 escaped.push(c);
-            }
+            },
             _ => escaped.push(c),
         }
     }
@@ -98,7 +99,7 @@ pub enum LinkAction {
     Open,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TerminalSize {
     pub cell_width: u16,
     pub cell_height: u16,
@@ -157,6 +158,7 @@ impl From<TerminalSize> for WindowSize {
 pub struct Backend {
     term: Arc<FairMutex<Term<EventProxy>>>,
     size: TerminalSize,
+    applied_size: TerminalSize,
     notifier: Notifier,
     pub(crate) last_content: RenderableContent,
     pub(crate) url_regex: RegexSearch,
@@ -184,18 +186,9 @@ impl Backend {
 
         let event_proxy = EventProxy(pty_event_proxy_sender);
 
-        let mut term = Term::new(config, &terminal_size, event_proxy.clone());
-
-        let cursor = term.grid_mut().cursor_cell().clone();
-
-        let initial_content = RenderableContent {
-            grid: term.grid().clone(),
-            selectable_range: None,
-            terminal_mode: *term.mode(),
-            terminal_size,
-            cursor: cursor.clone(),
-            hovered_hyperlink: None,
-        };
+        let term = Term::new(config, &terminal_size, event_proxy.clone());
+        let mut initial_content = RenderableContent::default();
+        initial_content.sync_from(&term, terminal_size);
 
         let term = Arc::new(FairMutex::new(term));
 
@@ -209,6 +202,7 @@ impl Backend {
         Ok(Self {
             term: term.clone(),
             size: terminal_size,
+            applied_size: terminal_size,
             notifier,
             last_content: initial_content,
             url_regex: RegexSearch::new(URL_REGEX).expect("invalid url regexp"),
@@ -244,12 +238,20 @@ impl Backend {
             Command::Write(input) => {
                 // Write to PTY immediately (no lock needed).
                 self.write(input);
-                // Try to scroll to bottom without blocking. If the lock is
-                // busy, skip — it'll catch up on the next sync.
+                // Try to scroll to bottom without blocking. The caller owns
+                // snapshot publication, so this command only mutates the live
+                // terminal.
                 let term = self.term.clone();
                 if let Some(mut term) = term.try_lock_unfair() {
                     term.scroll_display(Scroll::Bottom);
-                    self.internal_sync(&mut term);
+                }
+                return Action::default();
+            },
+            Command::Resize(layout_size, font_measure) => {
+                self.update_size(layout_size, font_measure);
+                let term = self.term.clone();
+                if let Some(mut term) = term.try_lock_unfair() {
+                    self.apply_resize(&mut term);
                 }
                 return Action::default();
             },
@@ -257,7 +259,7 @@ impl Backend {
             _ => {},
         }
 
-        // Scroll, Resize, Select, Link — need the terminal lock.
+        // Scroll, Select, Link — need the terminal lock.
         // Use try_lock_unfair to avoid blocking the main thread if the PTY
         // event loop is holding the lease during a burst of output.
         let term_arc = self.term.clone();
@@ -265,9 +267,6 @@ impl Backend {
             match cmd {
                 Command::Scroll(delta) => {
                     self.scroll(&mut term, delta);
-                },
-                Command::Resize(layout_size, font_measure) => {
-                    self.resize(&mut term, layout_size, font_measure);
                 },
                 Command::SelectStart(selection_type, (x, y)) => {
                     self.start_selection(&mut term, selection_type, x, y);
@@ -284,14 +283,14 @@ impl Backend {
                 // Already handled above — can't reach here.
                 Command::ProcessAlacrittyEvent(_)
                 | Command::MouseReport(..)
-                | Command::Write(_) => {},
+                | Command::Write(_)
+                | Command::Resize(..) => {},
             };
-            self.internal_sync(&mut term);
         }
         // If try_lock_unfair() failed, the command is silently dropped.
         // This is acceptable: scroll/select/link events are continuous and
-        // will be retried on the next mouse/keyboard event. Resize is
-        // handled by sync_and_redraw() which also tries the lock.
+        // will be retried on the next mouse/keyboard event. Resize state is
+        // retained and applied by the next successful sync.
 
         Action::default()
     }
@@ -304,14 +303,20 @@ impl Backend {
     ) {
         match link_action {
             LinkAction::Hover => {
-                self.last_content.hovered_hyperlink = self.regex_match_at(
+                let hovered_hyperlink = self.regex_match_at(
                     terminal,
                     point,
                     &mut self.url_regex.clone(),
                 );
+                let hovered_url = hovered_hyperlink
+                    .as_ref()
+                    .map(|range| Self::text_for_range(terminal, range));
+                self.last_content.hovered_hyperlink = hovered_hyperlink;
+                self.last_content.hovered_url = hovered_url;
             },
             LinkAction::Clear => {
                 self.last_content.hovered_hyperlink = None;
+                self.last_content.hovered_url = None;
             },
             LinkAction::Open => {
                 self.open_link();
@@ -320,22 +325,31 @@ impl Backend {
     }
 
     fn open_link(&self) {
-        if let Some(range) = &self.last_content.hovered_hyperlink {
-            let start = range.start();
-            let end = range.end();
-
-            let mut url = String::from(self.last_content.grid.index(*start).c);
-            for indexed in self.last_content.grid.iter_from(*start) {
-                url.push(indexed.c);
-                if indexed.point == *end {
-                    break;
-                }
-            }
-
+        if let Some(url) = &self.last_content.hovered_url {
             open::that(url).unwrap_or_else(|_| {
                 panic!("link opening is failed");
             })
         }
+    }
+
+    fn text_for_range<T: EventListener>(
+        terminal: &Term<T>,
+        range: &RangeInclusive<Point>,
+    ) -> String {
+        let start = *range.start();
+        let end = *range.end();
+        let mut text = String::from(terminal.grid()[start].c);
+        if start == end {
+            return text;
+        }
+
+        for indexed in terminal.grid().iter_from(*range.start()) {
+            text.push(indexed.c);
+            if indexed.point == end {
+                break;
+            }
+        }
+        text
     }
 
     fn process_mouse_report(
@@ -480,9 +494,8 @@ impl Backend {
         }
     }
 
-    fn resize(
+    fn update_size(
         &mut self,
-        terminal: &mut Term<EventProxy>,
         layout_size: Option<Size<f32>>,
         font_measure: Option<Size<f32>>,
     ) {
@@ -503,12 +516,24 @@ impl Backend {
         if lines > 0 && cols > 0 {
             self.size.num_lines = lines;
             self.size.num_cols = cols;
-            self.notifier.on_resize(self.size.into());
+        }
+    }
+
+    fn apply_resize(&mut self, terminal: &mut Term<EventProxy>) {
+        if self.size == self.applied_size {
+            return;
+        }
+
+        self.notifier.on_resize(self.size.into());
+        if self.size.num_cols != self.applied_size.num_cols
+            || self.size.num_lines != self.applied_size.num_lines
+        {
             terminal.resize(TermSize::new(
                 self.size.num_cols as usize,
                 self.size.num_lines as usize,
             ));
         }
+        self.applied_size = self.size;
     }
 
     fn write<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
@@ -550,29 +575,21 @@ impl Backend {
         String::new()
     }
 
-    pub fn sync(&mut self) {
+    pub fn sync(&mut self) -> bool {
         let term_arc = self.term.clone();
         // Use try_lock_unfair to avoid blocking the main thread.
         // If the PTY event loop holds the lock, we skip this sync —
         // the content will be slightly stale until the next frame.
-        let mut guard = term_arc.try_lock_unfair();
-        if let Some(ref mut term) = guard {
-            self.internal_sync(term);
-        }
+        let Some(mut term) = term_arc.try_lock_unfair() else {
+            return false;
+        };
+        self.apply_resize(&mut term);
+        self.internal_sync(&term);
+        true
     }
 
-    fn internal_sync(&mut self, terminal: &mut Term<EventProxy>) {
-        let selectable_range = match &terminal.selection {
-            Some(s) => s.to_range(terminal),
-            None => None,
-        };
-
-        let cursor = terminal.grid_mut().cursor_cell().clone();
-        self.last_content.grid = terminal.grid().clone();
-        self.last_content.selectable_range = selectable_range;
-        self.last_content.cursor = cursor.clone();
-        self.last_content.terminal_mode = *terminal.mode();
-        self.last_content.terminal_size = self.size;
+    fn internal_sync(&mut self, terminal: &Term<EventProxy>) {
+        self.last_content.sync_from(terminal, self.size);
     }
 
     pub fn renderable_content(&self) -> &RenderableContent {
@@ -605,7 +622,9 @@ impl Backend {
         let start = Point::new(history_start, Column(0));
         let end = Point::new(viewport_end, term.last_column());
 
-        for rm in RegexIter::new(start, end, Direction::Right, &term, &mut regex) {
+        for rm in
+            RegexIter::new(start, end, Direction::Right, &term, &mut regex)
+        {
             matches.push(SearchMatch {
                 start: *rm.start(),
                 end: *rm.end(),
@@ -721,25 +740,170 @@ fn visible_regex_match_iter<'a>(
         .take_while(move |rm| rm.start().line <= viewport_end)
 }
 
+pub struct RenderableCell {
+    pub point: Point,
+    pub cell: Cell,
+}
+
 pub struct RenderableContent {
-    pub grid: Grid<Cell>,
+    pub cells: Vec<RenderableCell>,
+    pub display_offset: usize,
     pub hovered_hyperlink: Option<RangeInclusive<Point>>,
     pub selectable_range: Option<SelectionRange>,
+    pub cursor_point: Point,
     pub cursor: Cell,
     pub terminal_mode: TermMode,
     pub terminal_size: TerminalSize,
+    hovered_url: Option<String>,
+}
+
+impl RenderableContent {
+    fn sync_from<T: EventListener>(
+        &mut self,
+        terminal: &Term<T>,
+        terminal_size: TerminalSize,
+    ) {
+        let renderable = terminal.renderable_content();
+        let cursor_point = renderable.cursor.point;
+        let cursor = terminal.grid()[cursor_point].clone();
+        let selectable_range = renderable.selection;
+        let display_offset = renderable.display_offset;
+        let terminal_mode = renderable.mode;
+
+        self.cells.clear();
+        self.cells.extend(renderable.display_iter.map(|indexed| {
+            RenderableCell {
+                point: indexed.point,
+                cell: indexed.cell.clone(),
+            }
+        }));
+        self.display_offset = display_offset;
+        self.selectable_range = selectable_range;
+        self.cursor_point = cursor_point;
+        self.cursor = cursor;
+        self.terminal_mode = terminal_mode;
+        self.terminal_size = terminal_size;
+    }
 }
 
 impl Default for RenderableContent {
     fn default() -> Self {
         Self {
-            grid: Grid::new(0, 0, 0),
+            cells: Vec::new(),
+            display_offset: 0,
             hovered_hyperlink: None,
             selectable_range: None,
+            cursor_point: Point::default(),
             cursor: Cell::default(),
             terminal_mode: TermMode::empty(),
             terminal_size: TerminalSize::default(),
+            hovered_url: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::cell::Flags;
+    use alacritty_terminal::vte::ansi::Color;
+
+    fn test_term(
+        columns: usize,
+        lines: usize,
+        history_limit: usize,
+    ) -> Term<VoidListener> {
+        let config = term::Config {
+            scrolling_history: history_limit,
+            ..term::Config::default()
+        };
+        let size = TermSize::new(columns, lines);
+        Term::new(config, &size, VoidListener)
+    }
+
+    fn add_history(term: &mut Term<VoidListener>, lines: usize) {
+        let screen_lines = term.screen_lines() as i32;
+        let region = Line(0)..Line(screen_lines);
+        for _ in 0..lines {
+            term.grid_mut().scroll_up::<Color>(&region, 1);
+        }
+    }
+
+    fn snapshot(term: &Term<VoidListener>) -> RenderableContent {
+        let mut snapshot = RenderableContent::default();
+        let size = TerminalSize {
+            num_cols: term.columns() as u16,
+            num_lines: term.screen_lines() as u16,
+            ..TerminalSize::default()
+        };
+        snapshot.sync_from(term, size);
+        snapshot
+    }
+
+    #[test]
+    fn viewport_snapshot_size_is_independent_of_history() {
+        let empty = test_term(4, 3, 30_000);
+        let empty_snapshot = snapshot(&empty);
+
+        let mut with_history = test_term(4, 3, 30_000);
+        add_history(&mut with_history, 30_000);
+        let history_snapshot = snapshot(&with_history);
+
+        assert_eq!(with_history.grid().history_size(), 30_000);
+        assert_eq!(empty_snapshot.cells.len(), 12);
+        assert_eq!(history_snapshot.cells.len(), empty_snapshot.cells.len());
+    }
+
+    #[test]
+    fn viewport_snapshot_reuses_capacity_at_the_same_size() {
+        let mut term = test_term(4, 3, 30_000);
+        let mut snapshot = snapshot(&term);
+        let initial_capacity = snapshot.cells.capacity();
+
+        add_history(&mut term, 100);
+        snapshot.sync_from(&term, snapshot.terminal_size);
+
+        assert_eq!(snapshot.cells.len(), 12);
+        assert_eq!(snapshot.cells.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn viewport_snapshot_uses_vi_mode_cursor() {
+        let mut term = test_term(4, 3, 0);
+        term.toggle_vi_mode();
+        term.vi_mode_cursor.point = Point::new(Line(1), Column(2));
+
+        let snapshot = snapshot(&term);
+
+        assert_eq!(snapshot.cursor_point, Point::new(Line(1), Column(2)));
+    }
+
+    #[test]
+    fn viewport_snapshot_normalizes_wide_character_spacer_cursor() {
+        let mut term = test_term(4, 3, 0);
+        let spacer = Point::new(Line(0), Column(1));
+        term.grid_mut().cursor.point = spacer;
+        term.grid_mut()[spacer]
+            .flags
+            .insert(Flags::WIDE_CHAR_SPACER);
+
+        let snapshot = snapshot(&term);
+
+        assert_eq!(snapshot.cursor_point, Point::new(Line(0), Column(0)));
+    }
+
+    #[test]
+    fn text_for_range_includes_each_cell_once() {
+        let mut term = test_term(4, 2, 0);
+        term.grid_mut()[Line(0)][Column(0)].c = 'h';
+        term.grid_mut()[Line(0)][Column(1)].c = 't';
+        term.grid_mut()[Line(0)][Column(2)].c = 't';
+        term.grid_mut()[Line(0)][Column(3)].c = 'p';
+        let range =
+            Point::new(Line(0), Column(0))..=Point::new(Line(0), Column(3));
+
+        assert_eq!(Backend::text_for_range(&term, &range), "http");
     }
 }
 
