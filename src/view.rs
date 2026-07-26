@@ -159,10 +159,7 @@ impl<'a> TerminalView<'a> {
                 mouse::click::Kind::Triple => SelectionType::Lines,
             };
             state.last_click = Some(current_click);
-            Command::SelectStart(
-                selection_type,
-                (rel_x, rel_y),
-            )
+            Command::SelectStart(selection_type, (rel_x, rel_y))
         };
         commands.push(cmd);
         state.is_dragged = true;
@@ -181,7 +178,7 @@ impl<'a> TerminalView<'a> {
             cursor_x,
             cursor_y,
             &terminal_content.terminal_size,
-            terminal_content.grid.display_offset(),
+            terminal_content.display_offset,
         );
 
         // Handle command or selection update based on terminal mode and modifiers
@@ -249,7 +246,12 @@ impl<'a> TerminalView<'a> {
         match delta {
             ScrollDelta::Lines { y, .. } => {
                 let lines = y.signum() * y.abs().round();
-                Self::push_wheel_scroll_command(state, terminal_mode, lines as i32, commands);
+                Self::push_wheel_scroll_command(
+                    state,
+                    terminal_mode,
+                    lines as i32,
+                    commands,
+                );
             },
             ScrollDelta::Pixels { y, .. } => {
                 state.scroll_pixels += y;
@@ -257,7 +259,12 @@ impl<'a> TerminalView<'a> {
                 let lines = (state.scroll_pixels / line_height).trunc();
                 state.scroll_pixels %= line_height;
                 if lines != 0.0 {
-                    Self::push_wheel_scroll_command(state, terminal_mode, lines as i32, commands);
+                    Self::push_wheel_scroll_command(
+                        state,
+                        terminal_mode,
+                        lines as i32,
+                        commands,
+                    );
                 }
             },
         }
@@ -360,7 +367,8 @@ impl<'a> TerminalView<'a> {
                 if let Some(data) = clipboard.read(ClipboardKind::Standard) {
                     // Normalize line endings: terminals expect \r for newlines.
                     // Clipboard text from Windows or web content may have \r\n.
-                    let normalized = data.replace("\r\n", "\r").replace('\n', "\r");
+                    let normalized =
+                        data.replace("\r\n", "\r").replace('\n', "\r");
                     let mut input: Vec<u8> = Vec::new();
                     let bracketed = last_content
                         .terminal_mode
@@ -451,7 +459,7 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
         _style: &iced::advanced::renderer::Style,
         layout: iced::advanced::Layout,
         _cursor: Cursor,
-        viewport: &Rectangle,
+        _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<TerminalViewState>();
         let content = self.term.backend.renderable_content();
@@ -470,7 +478,7 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
 
         let geom = self.term.cache.draw(renderer, frame_size, |frame| {
             // Precompute constants used in the inner loop
-            let display_offset = content.grid.display_offset() as f32;
+            let display_offset = content.display_offset as f32;
             let cell_size = Size::new(cell_width, cell_height);
             let half_w = cell_width * 0.5;
             let half_h = cell_height * 0.5;
@@ -484,7 +492,7 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
             let mut last_line: Option<i32> = None;
             let mut bg_batch_rect = BackgroundRect::default();
 
-            for indexed in content.grid.display_iter() {
+            for indexed in &content.cells {
                 // Compute per-cell geometry cheaply
                 let line = indexed.point.line.0;
                 let col = indexed.point.column.0 as f32;
@@ -497,8 +505,8 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 let cell_center_x = x + half_w;
 
                 // Resolve colors for this cell
-                let mut fg = self.term.theme.get_color(indexed.fg);
-                let mut bg = self.term.theme.get_color(indexed.bg);
+                let mut fg = self.term.theme.get_color(indexed.cell.fg);
+                let mut bg = self.term.theme.get_color(indexed.cell.bg);
 
                 // If the new line was detected,
                 // need to flush pending background rect and init the new one
@@ -588,7 +596,7 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 }
 
                 // Handle cursor rendering
-                if content.grid.cursor.point == indexed.point
+                if content.cursor_point == indexed.point
                     && content.terminal_mode.contains(TermMode::SHOW_CURSOR)
                 {
                     let cursor_color =
@@ -599,8 +607,8 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 }
 
                 // Draw text
-                if indexed.c != ' ' && indexed.c != '\t' {
-                    if content.grid.cursor.point == indexed.point
+                if indexed.cell.c != ' ' && indexed.cell.c != '\t' {
+                    if content.cursor_point == indexed.point
                         && content.terminal_mode.contains(TermMode::APP_CURSOR)
                     {
                         fg = bg;
@@ -645,10 +653,14 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
         use iced::advanced::graphics::geometry::Renderer as _;
         use iced_core::Renderer as _;
         // Translate geometry from widget-relative coords to absolute window position
-        let translation = iced::Vector::new(layout.position().x, layout.position().y);
-        renderer.with_translation(translation, |renderer: &mut iced::Renderer| {
-            renderer.draw_geometry(geom);
-        });
+        let translation =
+            iced::Vector::new(layout.position().x, layout.position().y);
+        renderer.with_translation(
+            translation,
+            |renderer: &mut iced::Renderer| {
+                renderer.draw_geometry(geom);
+            },
+        );
     }
 
     fn update(
@@ -674,7 +686,9 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
 
         let layout_size = layout.bounds().size();
         // Send resize if size changed OR force resize on first few events to handle layout settling
-        let force_resize = state.resize_count < 5 && layout_size.width > 0.0 && layout_size.height > 0.0;
+        let force_resize = state.resize_count < 5
+            && layout_size.width > 0.0
+            && layout_size.height > 0.0;
         let needs_resize = state.size != layout_size || force_resize;
         if needs_resize {
             state.size = layout_size;
@@ -1361,21 +1375,11 @@ mod tests {
             assert_eq!(commands.len(), 2);
             assert!(matches!(
                 commands[0],
-                Command::MouseReport(
-                    MouseButton::ScrollUp,
-                    _,
-                    _,
-                    true
-                )
+                Command::MouseReport(MouseButton::ScrollUp, _, _, true)
             ));
             assert!(matches!(
                 commands[1],
-                Command::MouseReport(
-                    MouseButton::ScrollUp,
-                    _,
-                    _,
-                    true
-                )
+                Command::MouseReport(MouseButton::ScrollUp, _, _, true)
             ));
         }
 
@@ -1396,12 +1400,7 @@ mod tests {
             assert_eq!(commands.len(), 1);
             assert!(matches!(
                 commands[0],
-                Command::MouseReport(
-                    MouseButton::ScrollDown,
-                    _,
-                    _,
-                    true
-                )
+                Command::MouseReport(MouseButton::ScrollDown, _, _, true)
             ));
         }
     }
